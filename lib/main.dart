@@ -95,6 +95,7 @@ class StudyStore {
       }
       final entries =
           jsonDecode(await response.transform(utf8.decoder).join()) as List;
+      final available = <String, String>{};
       for (final entry in entries) {
         if (entry is! Map<String, dynamic> || entry['type'] != 'file') continue;
         final path = entry['path'] as String?;
@@ -103,35 +104,45 @@ class StudyStore {
             name == null ||
             !path.startsWith('blocks/') ||
             path.substring(7).contains('/') ||
-            !name.endsWith('.json'))
+            !name.endsWith('.json') ||
+            name == 'catalog.json')
           continue;
         final id = name.substring(0, name.length - 5);
         if (!RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(id)) continue;
-        final rawRequest = await _http.getUrl(
-          Uri.https('raw.githubusercontent.com', '/$_repo/$_branch/$path'),
-        );
-        rawRequest.headers.set(HttpHeaders.userAgentHeader, 'Stay-Relevant');
-        final rawResponse = await rawRequest.close().timeout(
-          const Duration(seconds: 20),
-        );
-        if (rawResponse.statusCode != HttpStatus.ok) continue;
-        final bytes = await rawResponse.fold<List<int>>(
-          [],
-          (all, chunk) => all..addAll(chunk),
-        );
-        if (bytes.length > 15 * 1024 * 1024) continue;
-        final source = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-        final questions = source['questions'] as List?;
-        if (questions == null || questions.isEmpty) continue;
+        available[id] = path;
+      }
+      final catalogRequest = await _http.getUrl(
+        Uri.https(
+          'raw.githubusercontent.com',
+          '/$_repo/$_branch/blocks/catalog.json',
+        ),
+      );
+      catalogRequest.headers.set(HttpHeaders.userAgentHeader, 'Stay-Relevant');
+      final catalogResponse = await catalogRequest.close().timeout(
+        const Duration(seconds: 12),
+      );
+      if (catalogResponse.statusCode != HttpStatus.ok) {
+        throw HttpException('Не удалось загрузить каталог блоков.');
+      }
+      final catalog =
+          jsonDecode(await catalogResponse.transform(utf8.decoder).join())
+              as List;
+      for (final item in catalog) {
+        if (item is! Map<String, dynamic>) continue;
+        final id = item['id'] as String?;
+        final path = available[id];
+        if (id == null ||
+            path == null ||
+            item['title'] is! String ||
+            item['question_count'] is! int ||
+            item['category_count'] is! int)
+          continue;
         _catalog[id] = {
           'id': id,
-          'title': source['title'] ?? id,
+          'title': item['title'],
           'path': path,
-          'question_count': questions.length,
-          'category_count': questions
-              .map((q) => (q as Map)['category'])
-              .toSet()
-              .length,
+          'question_count': item['question_count'],
+          'category_count': item['category_count'],
         };
       }
     } catch (_) {
