@@ -13318,5 +13318,6 @@
     "incorrect_field": "distractors",
     "distractors_per_question": 3,
     "note": "Варианты-ловушки сформулированы для соответствующей темы; правильный вариант не собирается из ответов других карточек."
-  }
+  },
+  "id": "golang_mid_interview_questions"
 }

@@ -2,8 +2,6 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:flutter/services.dart';
-
 import 'package:flutter/widgets.dart';
 
 const ink = Color(0xFF15251F);
@@ -41,17 +39,33 @@ class TrainerApp extends StatelessWidget {
 }
 
 class StudyStore {
+  static const _repo = 'novikovvs/stay-relevant';
+  static const _branch = 'main';
   final _random = Random.secure();
+  final _http = HttpClient();
   final Map<String, Map<String, dynamic>> _banks = {};
+  final Map<String, Map<String, dynamic>> _catalog = {};
   final Map<String, Map<String, dynamic>> _progress = {};
   final Map<String, Map<String, dynamic>> _challenges = {};
+  bool _initialized = false;
   late final File _progressFile;
 
   Future<void> initialize() async {
+    if (_initialized) return;
     final home = Platform.environment['HOME'] ?? Directory.systemTemp.path;
-    final directory = Directory('$home/Library/Application Support/Go Fluent');
+    final directory = Directory(
+      '$home/Library/Application Support/Stay Relevant',
+    );
     await directory.create(recursive: true);
     _progressFile = File('${directory.path}/progress.json');
+    final legacyProgress = File(
+      '$home/Library/Application Support/Go Fluent/progress.json',
+    );
+    if (!await _progressFile.exists() && await legacyProgress.exists()) {
+      await legacyProgress.copy(_progressFile.path);
+    }
+    _blocksDirectory = Directory('${directory.path}/blocks');
+    await _blocksDirectory.create(recursive: true);
     if (await _progressFile.exists()) {
       final saved =
           jsonDecode(await _progressFile.readAsString())
@@ -61,30 +75,177 @@ class StudyStore {
         _progress[entry.key] = Map<String, dynamic>.from(entry.value as Map);
       }
     }
-    final index =
-        jsonDecode(await rootBundle.loadString('assets/questions/index.json'))
-            as List;
-    for (final asset in index.cast<String>()) {
-      final source =
-          jsonDecode(await rootBundle.loadString(asset))
-              as Map<String, dynamic>;
-      final questions = (source['questions'] as List)
-          .cast<Map<String, dynamic>>();
-      final id = asset.split('/').last.replaceFirst('.json', '');
-      _banks[id] = {
-        'id': id,
-        'title': source['title'] ?? id,
-        'question_count': questions.length,
-        'category_count': questions.map((q) => q['category']).toSet().length,
-        'questions': questions,
-      };
+    await _scanLocalBlocks();
+    try {
+      final request = await _http.getUrl(
+        Uri.https('api.github.com', '/repos/$_repo/contents/blocks', {
+          'ref': _branch,
+        }),
+      );
+      request.headers.set(
+        HttpHeaders.acceptHeader,
+        'application/vnd.github+json',
+      );
+      request.headers.set(HttpHeaders.userAgentHeader, 'Stay-Relevant');
+      final response = await request.close().timeout(
+        const Duration(seconds: 12),
+      );
+      if (response.statusCode != HttpStatus.ok) {
+        throw HttpException('GitHub вернул ${response.statusCode}');
+      }
+      final entries =
+          jsonDecode(await response.transform(utf8.decoder).join()) as List;
+      for (final entry in entries) {
+        if (entry is! Map<String, dynamic> || entry['type'] != 'file') continue;
+        final path = entry['path'] as String?;
+        final name = entry['name'] as String?;
+        if (path == null ||
+            name == null ||
+            !path.startsWith('blocks/') ||
+            path.substring(7).contains('/') ||
+            !name.endsWith('.json'))
+          continue;
+        final id = name.substring(0, name.length - 5);
+        if (!RegExp(r'^[a-zA-Z0-9_-]+$').hasMatch(id)) continue;
+        final rawRequest = await _http.getUrl(
+          Uri.https('raw.githubusercontent.com', '/$_repo/$_branch/$path'),
+        );
+        rawRequest.headers.set(HttpHeaders.userAgentHeader, 'Stay-Relevant');
+        final rawResponse = await rawRequest.close().timeout(
+          const Duration(seconds: 20),
+        );
+        if (rawResponse.statusCode != HttpStatus.ok) continue;
+        final bytes = await rawResponse.fold<List<int>>(
+          [],
+          (all, chunk) => all..addAll(chunk),
+        );
+        if (bytes.length > 15 * 1024 * 1024) continue;
+        final source = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+        final questions = source['questions'] as List?;
+        if (questions == null || questions.isEmpty) continue;
+        _catalog[id] = {
+          'id': id,
+          'title': source['title'] ?? id,
+          'path': path,
+          'question_count': questions.length,
+          'category_count': questions
+              .map((q) => (q as Map)['category'])
+              .toSet()
+              .length,
+        };
+      }
+    } catch (_) {
+      // Downloaded blocks remain available offline when the catalog cannot load.
     }
+    for (final entry in _banks.entries) {
+      _catalog.putIfAbsent(
+        entry.key,
+        () => Map<String, dynamic>.from(entry.value),
+      );
+    }
+    _initialized = true;
+  }
+
+  late final Directory _blocksDirectory;
+
+  Future<void> _scanLocalBlocks() async {
+    _banks.clear();
+    await for (final entity in _blocksDirectory.list()) {
+      if (entity is! File || !entity.path.endsWith('.json')) continue;
+      try {
+        final source =
+            jsonDecode(await entity.readAsString()) as Map<String, dynamic>;
+        _addBank(
+          entity.uri.pathSegments.last.replaceFirst('.json', ''),
+          source,
+        );
+      } catch (_) {
+        // Ignore malformed files; validation runs again when downloading.
+      }
+    }
+  }
+
+  void _addBank(String id, Map<String, dynamic> source) {
+    if (source['id'] != null && source['id'] != id) {
+      throw const FormatException('ID блока не совпадает с именем файла.');
+    }
+    final questions = (source['questions'] as List)
+        .cast<Map<String, dynamic>>();
+    final ids = <String>{};
+    if (questions.isEmpty ||
+        questions.any(
+          (q) =>
+              q['id'] is! String ||
+              q['question'] is! String ||
+              q['answer'] is! String ||
+              q['distractors'] is! List ||
+              (q['distractors'] as List).length != 3 ||
+              (q['distractors'] as List).any((answer) => answer is! String) ||
+              (q['distractors'] as List).toSet().length != 3 ||
+              (q['distractors'] as List).contains(q['answer']) ||
+              !ids.add(q['id'] as String),
+        )) {
+      throw const FormatException('Неверный формат блока вопросов.');
+    }
+    _banks[id] = {
+      'id': id,
+      'title': source['title'] ?? id,
+      'question_count': questions.length,
+      'category_count': questions.map((q) => q['category']).toSet().length,
+      'questions': questions,
+    };
+  }
+
+  Future<void> download(String id) async {
+    final entry = _catalog[id];
+    if (entry == null || entry['path'] is! String)
+      throw Exception('Блок не найден в каталоге.');
+    final path = entry['path'] as String;
+    final uri = Uri.https(
+      'raw.githubusercontent.com',
+      '/$_repo/$_branch/$path',
+    );
+    final request = await _http.getUrl(uri);
+    request.headers.set(HttpHeaders.userAgentHeader, 'Stay-Relevant');
+    final response = await request.close().timeout(const Duration(seconds: 30));
+    if (response.statusCode != HttpStatus.ok)
+      throw HttpException('Не удалось скачать блок (${response.statusCode}).');
+    final bytes = await response.fold<List<int>>(
+      [],
+      (all, chunk) => all..addAll(chunk),
+    );
+    if (bytes.length > 15 * 1024 * 1024)
+      throw const FormatException('Файл блока слишком большой.');
+    final source = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+    _addBank(id, source);
+    await File(
+      '${_blocksDirectory.path}/$id.json',
+    ).writeAsBytes(bytes, flush: true);
   }
 
   Future<dynamic> get(String path) async {
     if (path == '/banks') {
       return _banks.values
           .map((b) => Map<String, dynamic>.from(b)..remove('questions'))
+          .toList();
+    }
+    if (path == '/catalog') {
+      return _catalog.values
+          .map(
+            (b) => {
+              'id': b['id'],
+              'title': b['title'],
+              'question_count':
+                  _banks[b['id']]?['question_count'] ??
+                  b['question_count'] ??
+                  0,
+              'category_count':
+                  _banks[b['id']]?['category_count'] ??
+                  b['category_count'] ??
+                  0,
+              'downloaded': _banks.containsKey(b['id']),
+            },
+          )
           .toList();
     }
     final uri = Uri.parse(path);
@@ -310,16 +471,19 @@ class QuestionBank {
     required this.title,
     required this.count,
     required this.categories,
+    this.downloaded = true,
   });
   final String id;
   final String title;
   final int count;
   final int categories;
+  final bool downloaded;
   factory QuestionBank.fromJson(Map<String, dynamic> json) => QuestionBank(
     id: json['id'] as String,
     title: json['title'] as String,
     count: json['question_count'] as int,
     categories: json['category_count'] as int,
+    downloaded: json['downloaded'] as bool? ?? true,
   );
 }
 
@@ -416,6 +580,7 @@ class _TrainerHomeState extends State<TrainerHome> {
   String? selectedBank;
   bool inQuiz = false;
   bool loading = true;
+  String? downloading;
   String? error;
 
   @override
@@ -431,12 +596,12 @@ class _TrainerHomeState extends State<TrainerHome> {
     });
     try {
       await store.initialize();
-      final raw = await store.get('/banks') as List;
+      final raw = await store.get('/catalog') as List;
       final loaded = raw
           .map((e) => QuestionBank.fromJson(Map<String, dynamic>.from(e)))
           .toList();
       final stats = <String, LearningProgress>{};
-      for (final bank in loaded) {
+      for (final bank in loaded.where((bank) => bank.downloaded)) {
         final value = await store.get(
           '/progress?bank=${Uri.encodeQueryComponent(bank.id)}',
         );
@@ -456,6 +621,23 @@ class _TrainerHomeState extends State<TrainerHome> {
         loading = false;
         error = e.toString().replaceFirst('Exception: ', '');
       });
+    }
+  }
+
+  Future<void> _download(QuestionBank bank) async {
+    setState(() {
+      downloading = bank.id;
+    });
+    try {
+      await store.download(bank.id);
+      await _load();
+    } catch (e) {
+      if (mounted)
+        setState(() {
+          error = e.toString().replaceFirst('Exception: ', '');
+        });
+    } finally {
+      if (mounted) setState(() => downloading = null);
     }
   }
 
@@ -488,9 +670,10 @@ class _TrainerHomeState extends State<TrainerHome> {
             inQuiz: inQuiz,
             onHome: () => setState(() => inQuiz = false),
             onReview: () {
-              if (banks.isEmpty) return;
+              final downloaded = banks.where((bank) => bank.downloaded);
+              if (downloaded.isEmpty) return;
               setState(() {
-                selectedBank ??= banks.first.id;
+                selectedBank ??= downloaded.first.id;
                 inQuiz = true;
               });
             },
@@ -513,6 +696,8 @@ class _TrainerHomeState extends State<TrainerHome> {
                 : _Dashboard(
                     banks: banks,
                     progress: progress,
+                    downloading: downloading,
+                    onDownload: _download,
                     onStart: (bank) => setState(() {
                       selectedBank = bank.id;
                       inQuiz = true;
@@ -554,7 +739,7 @@ class _Sidebar extends StatelessWidget {
               ),
               child: const Center(
                 child: Text(
-                  'g',
+                  'S',
                   style: TextStyle(
                     color: ink,
                     fontSize: 25,
@@ -568,7 +753,7 @@ class _Sidebar extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'go / fluent',
+                  'stay relevant',
                   style: TextStyle(
                     color: Color(0xFFFFFFFF),
                     fontSize: 16,
@@ -578,7 +763,7 @@ class _Sidebar extends StatelessWidget {
                 ),
                 SizedBox(height: 2),
                 Text(
-                  'ТЕХНИЧЕСКИЙ ТРЕНАЖЁР',
+                  'ТРЕНАЖЁР',
                   style: TextStyle(
                     color: Color(0xFF9AA79F),
                     fontSize: 8,
@@ -590,17 +775,7 @@ class _Sidebar extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 54),
-        const Text(
-          'ОБУЧЕНИЕ',
-          style: TextStyle(
-            color: Color(0xFF7E9187),
-            fontSize: 10,
-            fontWeight: FontWeight.w800,
-            letterSpacing: 1.4,
-          ),
-        ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 44),
         _NavItem(
           icon: '⌂',
           label: 'Моя программа',
@@ -615,47 +790,6 @@ class _Sidebar extends StatelessWidget {
           onTap: onReview,
         ),
         const Spacer(),
-        Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: const Color(0xFF24382F),
-            borderRadius: BorderRadius.circular(17),
-            border: Border.all(color: const Color(0xFF334A3E)),
-          ),
-          child: const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'МАЛЕНЬКИМИ ШАГАМИ',
-                style: TextStyle(
-                  color: green,
-                  fontSize: 9,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 1,
-                ),
-              ),
-              SizedBox(height: 9),
-              Text(
-                'Пять минут сегодня —\nсильнее, чем час раз в месяц.',
-                style: TextStyle(
-                  color: Color(0xFFD3DDD6),
-                  fontSize: 12,
-                  height: 1.45,
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 15),
-        const Text(
-          'ЛОКАЛЬНЫЙ ПРОГРЕСС',
-          style: TextStyle(
-            color: Color(0xFF7E9187),
-            fontSize: 9,
-            letterSpacing: 1,
-            fontWeight: FontWeight.w700,
-          ),
-        ),
       ],
     ),
   );
@@ -713,10 +847,14 @@ class _Dashboard extends StatelessWidget {
     required this.banks,
     required this.progress,
     required this.onStart,
+    required this.onDownload,
+    required this.downloading,
   });
   final List<QuestionBank> banks;
   final Map<String, LearningProgress> progress;
   final ValueChanged<QuestionBank> onStart;
+  final ValueChanged<QuestionBank> onDownload;
+  final String? downloading;
 
   @override
   Widget build(BuildContext context) {
@@ -777,25 +915,19 @@ class _Dashboard extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               const Text(
-                'Привет, будущий\nGo-мастер.',
+                'Stay Relevant',
                 style: TextStyle(
-                  fontSize: 38,
+                  fontSize: 32,
                   height: 1.06,
                   letterSpacing: -1.8,
                   fontWeight: FontWeight.w800,
                   color: ink,
                 ),
               ),
-              const SizedBox(height: 12),
-              const Text(
-                'Короткие раунды и умные повторения. Выбери блок и прокачай знания.',
-                style: TextStyle(color: muted, fontSize: 14),
-              ),
-              const SizedBox(height: 28),
+              const SizedBox(height: 22),
               _SummaryStrip(progress: totals),
-              const SizedBox(height: 18),
               _StatisticsPanel(progress: stats),
-              const SizedBox(height: 36),
+              const SizedBox(height: 26),
               Row(
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
@@ -803,7 +935,7 @@ class _Dashboard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'ТВОИ БЛОКИ',
+                        'БЛОКИ',
                         style: TextStyle(
                           color: greenDark,
                           fontSize: 10,
@@ -811,21 +943,11 @@ class _Dashboard extends StatelessWidget {
                           letterSpacing: 1.5,
                         ),
                       ),
-                      SizedBox(height: 7),
-                      Text(
-                        'Продолжить обучение',
-                        style: TextStyle(
-                          color: ink,
-                          fontSize: 21,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: -0.4,
-                        ),
-                      ),
                     ],
                   ),
                   const Spacer(),
                   Text(
-                    '${banks.length} ${_plural(banks.length, 'база', 'базы', 'баз')}',
+                    '${banks.length} ${_plural(banks.length, 'блок', 'блока', 'блоков')}',
                     style: const TextStyle(color: muted, fontSize: 12),
                   ),
                 ],
@@ -833,7 +955,7 @@ class _Dashboard extends StatelessWidget {
               const SizedBox(height: 17),
               if (banks.isEmpty)
                 const Text(
-                  'Пока нет баз вопросов. Добавь JSON в data/questions.',
+                  'Каталог пуст или недоступен.',
                   style: TextStyle(color: muted),
                 )
               else
@@ -848,11 +970,11 @@ class _Dashboard extends StatelessWidget {
                             progress[banks[i].id] ?? const LearningProgress(),
                         accent: i == 0 ? green : orange,
                         onTap: () => onStart(banks[i]),
+                        onDownload: () => onDownload(banks[i]),
+                        downloading: downloading == banks[i].id,
                       ),
                   ],
                 ),
-              const SizedBox(height: 26),
-              const _HowItWorks(),
             ],
           ),
         ),
@@ -1092,11 +1214,15 @@ class _BankCard extends StatefulWidget {
     required this.progress,
     required this.accent,
     required this.onTap,
+    required this.onDownload,
+    required this.downloading,
   });
   final QuestionBank bank;
   final LearningProgress progress;
   final Color accent;
   final VoidCallback onTap;
+  final VoidCallback onDownload;
+  final bool downloading;
   @override
   State<_BankCard> createState() => _BankCardState();
 }
@@ -1109,7 +1235,11 @@ class _BankCardState extends State<_BankCard> {
     onEnter: (_) => setState(() => hover = true),
     onExit: (_) => setState(() => hover = false),
     child: GestureDetector(
-      onTap: widget.onTap,
+      onTap: widget.downloading
+          ? null
+          : widget.bank.downloaded
+          ? widget.onTap
+          : widget.onDownload,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 160),
         width: 330,
@@ -1192,8 +1322,12 @@ class _BankCardState extends State<_BankCard> {
                   style: const TextStyle(color: muted, fontSize: 10),
                 ),
                 const Spacer(),
-                const Text(
-                  'НАЧАТЬ',
+                Text(
+                  widget.downloading
+                      ? 'ЗАГРУЗКА…'
+                      : widget.bank.downloaded
+                      ? 'НАЧАТЬ'
+                      : 'СКАЧАТЬ',
                   style: TextStyle(
                     color: greenDark,
                     fontSize: 10,
@@ -1873,7 +2007,7 @@ class _ConnectionState extends StatelessWidget {
   Widget build(BuildContext context) => Center(
     child: _ErrorCard(
       message:
-          '$message\n\nПроверь, что JSON-базы добавлены в assets/questions/index.json.',
+          '$message\n\nПроверь подключение к каталогу блоков и попробуй снова.',
       onRetry: onRetry,
     ),
   );

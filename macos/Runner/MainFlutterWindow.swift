@@ -13,6 +13,6 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
-    self.title = "Go Fluent"
+    self.title = "Stay Relevant"
   }
 }
